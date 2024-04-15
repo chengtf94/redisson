@@ -20,7 +20,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * 分布式锁：基于Redis，是java.util.concurrent.locks.Lock的分布式实现
+ * 分布式锁：是java.util.concurrent.locks.Lock的分布式实现
  *
  * @author Nikita Koksharov
  */
