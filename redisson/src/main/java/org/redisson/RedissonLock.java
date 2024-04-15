@@ -1,18 +1,3 @@
-/**
- * Copyright (c) 2013-2024 Nikita Koksharov
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 package org.redisson;
 
 import io.netty.util.Timeout;
@@ -35,17 +20,11 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Distributed implementation of {@link java.util.concurrent.locks.Lock}
- * Implements reentrant lock.<br>
- * Lock will be removed automatically if client disconnects.
- * <p>
- * Implements a <b>non-fair</b> locking so doesn't guarantees an acquire order.
+ * 分布式锁：基于Redis，是java.util.concurrent.locks.Lock的分布式实现
  *
  * @author Nikita Koksharov
- *
  */
 public class RedissonLock extends RedissonBaseLock {
-
     private static final Logger LOGGER = LoggerFactory.getLogger(RedissonLock.class);
 
     protected long internalLockLeaseTime;
@@ -54,6 +33,11 @@ public class RedissonLock extends RedissonBaseLock {
 
     final CommandAsyncExecutor commandExecutor;
 
+    /** 构造方法 */
+    public RedissonLock(String name, CommandAsyncExecutor commandExecutor) {
+        this(commandExecutor, name);
+        this.name = name;
+    }
     public RedissonLock(CommandAsyncExecutor commandExecutor, String name) {
         super(commandExecutor, name);
         this.commandExecutor = commandExecutor;
@@ -61,10 +45,6 @@ public class RedissonLock extends RedissonBaseLock {
         this.pubSub = commandExecutor.getConnectionManager().getSubscribeService().getLockPubSub();
     }
 
-    public RedissonLock(String name, CommandAsyncExecutor commandExecutor) {
-        this(commandExecutor, name);
-        this.name = name;
-    }
 
     String getChannelName() {
         return prefixName("redisson_lock__channel", getRawName());
