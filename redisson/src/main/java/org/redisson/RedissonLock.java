@@ -27,10 +27,9 @@ import java.util.concurrent.atomic.AtomicReference;
 public class RedissonLock extends RedissonBaseLock {
     private static final Logger LOGGER = LoggerFactory.getLogger(RedissonLock.class);
 
+    /** 内置默认锁过期时间（30s）、锁发布订阅、命令执行器 */
     protected long internalLockLeaseTime;
-
     protected final LockPubSub pubSub;
-
     final CommandAsyncExecutor commandExecutor;
 
     /** 构造方法 */
@@ -45,15 +44,7 @@ public class RedissonLock extends RedissonBaseLock {
         this.pubSub = commandExecutor.getConnectionManager().getSubscribeService().getLockPubSub();
     }
 
-
-    String getChannelName() {
-        return prefixName("redisson_lock__channel", getRawName());
-    }
-
-    String getUnlockLatchName(String requestId) {
-        return prefixName("redisson_unlock_latch", getRawName()) + ":" + requestId;
-    }
-
+    /** 获取锁 */
     @Override
     public void lock() {
         try {
@@ -62,7 +53,6 @@ public class RedissonLock extends RedissonBaseLock {
             throw new IllegalStateException();
         }
     }
-
     @Override
     public void lock(long leaseTime, TimeUnit unit) {
         try {
@@ -71,26 +61,26 @@ public class RedissonLock extends RedissonBaseLock {
             throw new IllegalStateException();
         }
     }
-
-
     @Override
     public void lockInterruptibly() throws InterruptedException {
         lock(-1, null, true);
     }
-
     @Override
     public void lockInterruptibly(long leaseTime, TimeUnit unit) throws InterruptedException {
         lock(leaseTime, unit, true);
     }
 
+    /** 获取锁：锁过期时间、锁等待过程中是否响应中断 */
     private void lock(long leaseTime, TimeUnit unit, boolean interruptibly) throws InterruptedException {
+
+        // #1 尝试获取锁，若ttl=null表示获取锁成功，直接返回
         long threadId = Thread.currentThread().getId();
         Long ttl = tryAcquire(-1, leaseTime, unit, threadId);
-        // lock acquired
         if (ttl == null) {
             return;
         }
 
+        // #2 获取失败，则订阅获取锁Entry并等待
         CompletableFuture<RedissonLockEntry> future = subscribe(threadId);
         pubSub.timeout(future);
         RedissonLockEntry entry;
@@ -100,6 +90,7 @@ public class RedissonLock extends RedissonBaseLock {
             entry = commandExecutor.get(future);
         }
 
+        // #3 自旋尝试再次获取锁，若获取成功则返回，否则阻塞等待ttl时间
         try {
             while (true) {
                 ttl = tryAcquire(-1, leaseTime, unit, threadId);
@@ -107,7 +98,6 @@ public class RedissonLock extends RedissonBaseLock {
                 if (ttl == null) {
                     break;
                 }
-
                 // waiting for message
                 if (ttl >= 0) {
                     try {
@@ -129,43 +119,25 @@ public class RedissonLock extends RedissonBaseLock {
         } finally {
             unsubscribe(entry, threadId);
         }
-//        get(lockAsync(leaseTime, unit));
     }
-    
+
+    /** 订阅频道：redisson_lock__channel:{业务锁标识} */
+    protected CompletableFuture<RedissonLockEntry> subscribe(long threadId) {
+        return pubSub.subscribe(getEntryName(), getChannelName());
+    }
+    String getChannelName() {
+        return prefixName("redisson_lock__channel", getRawName());
+    }
+
+    /** 尝试获取锁：锁等待时间、锁过期时间、业务线程ID */
     private Long tryAcquire(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
         return get(tryAcquireAsync0(waitTime, leaseTime, unit, threadId));
     }
-
     private RFuture<Long> tryAcquireAsync0(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
         return getServiceManager().execute(() -> tryAcquireAsync(waitTime, leaseTime, unit, threadId));
     }
-
-    private RFuture<Boolean> tryAcquireOnceAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
-        CompletionStage<Boolean> acquiredFuture;
-        if (leaseTime > 0) {
-            acquiredFuture = tryLockInnerAsync(waitTime, leaseTime, unit, threadId, RedisCommands.EVAL_NULL_BOOLEAN);
-        } else {
-            acquiredFuture = tryLockInnerAsync(waitTime, internalLockLeaseTime,
-                    TimeUnit.MILLISECONDS, threadId, RedisCommands.EVAL_NULL_BOOLEAN);
-        }
-
-        acquiredFuture = handleNoSync(threadId, acquiredFuture);
-
-        CompletionStage<Boolean> f = acquiredFuture.thenApply(acquired -> {
-            // lock acquired
-            if (acquired) {
-                if (leaseTime > 0) {
-                    internalLockLeaseTime = unit.toMillis(leaseTime);
-                } else {
-                    scheduleExpirationRenewal(threadId);
-                }
-            }
-            return acquired;
-        });
-        return new CompletableFutureWrapper<>(f);
-    }
-
     private RFuture<Long> tryAcquireAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
+        // #1 LUA脚本获取锁
         RFuture<Long> ttlRemainingFuture;
         if (leaseTime > 0) {
             ttlRemainingFuture = tryLockInnerAsync(waitTime, leaseTime, unit, threadId, RedisCommands.EVAL_LONG);
@@ -175,13 +147,13 @@ public class RedissonLock extends RedissonBaseLock {
         }
         CompletionStage<Long> s = handleNoSync(threadId, ttlRemainingFuture);
         ttlRemainingFuture = new CompletableFutureWrapper<>(s);
-
         CompletionStage<Long> f = ttlRemainingFuture.thenApply(ttlRemaining -> {
-            // lock acquired
+            // lock acquired：若leaseTime>0则表示业务自定义传入锁过期时间，否则使用默认过期时间，并启动看门狗自动续期
             if (ttlRemaining == null) {
                 if (leaseTime > 0) {
                     internalLockLeaseTime = unit.toMillis(leaseTime);
                 } else {
+                    // 看门狗自动续期
                     scheduleExpirationRenewal(threadId);
                 }
             }
@@ -189,24 +161,69 @@ public class RedissonLock extends RedissonBaseLock {
         });
         return new CompletableFutureWrapper<>(f);
     }
+    /** LUA脚本：获取锁 */
+    <T> RFuture<T> tryLockInnerAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId, RedisStrictCommand<T> command) {
+        // KEYS[1]为key业务锁标识，ARGV[1]为锁过期时间，ARGV[2]为field锁名称（UUID + 业务线程ID）
+        return evalWriteSyncedAsync(getRawName(), LongCodec.INSTANCE, command,
+                "if ((redis.call('exists', KEYS[1]) == 0) " +
+                        "or (redis.call('hexists', KEYS[1], ARGV[2]) == 1)) then " +
+                        "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
+                        "redis.call('pexpire', KEYS[1], ARGV[1]); " +
+                        "return nil; " +
+                        "end; " +
+                        "return redis.call('pttl', KEYS[1]);",
+                Collections.singletonList(getRawName()), unit.toMillis(leaseTime), getLockName(threadId));
+    }
+
+    /** LUA脚本：释放锁，解锁之后使用PUBLISH命令向频道redisson_lock__channel:{业务锁标识}发送消息通知等待锁的业务线程重新获取锁 */
+    protected RFuture<Boolean> unlockInnerAsync(long threadId, String requestId, int timeout) {
+        return evalWriteSyncedAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
+                "local val = redis.call('get', KEYS[3]); " +
+                        "if val ~= false then " +
+                        "return tonumber(val);" +
+                        "end; " +
+
+                        "if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then " +
+                        "return nil;" +
+                        "end; " +
+                        "local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1); " +
+                        "if (counter > 0) then " +
+                        "redis.call('pexpire', KEYS[1], ARGV[2]); " +
+                        "redis.call('set', KEYS[3], 0, 'px', ARGV[5]); " +
+                        "return 0; " +
+                        "else " +
+                        "redis.call('del', KEYS[1]); " +
+                        "redis.call(ARGV[4], KEYS[2], ARGV[1]); " +
+                        "redis.call('set', KEYS[3], 1, 'px', ARGV[5]); " +
+                        "return 1; " +
+                        "end; ",
+                Arrays.asList(getRawName(), getChannelName(), getUnlockLatchName(requestId)),
+                LockPubSub.UNLOCK_MESSAGE, internalLockLeaseTime,
+                getLockName(threadId), getSubscribeService().getPublishCommand(), timeout);
+    }
+
+    /** LUA脚本：强制释放锁，简单粗暴 */
+    @Override
+    public RFuture<Boolean> forceUnlockAsync() {
+        cancelExpirationRenewal(null, null);
+        return commandExecutor.syncedEvalWithRetry(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
+                "if (redis.call('del', KEYS[1]) == 1) then "
+                        + "redis.call(ARGV[2], KEYS[2], ARGV[1]); "
+                        + "return 1 "
+                        + "else "
+                        + "return 0 "
+                        + "end",
+                Arrays.asList(getRawName(), getChannelName()), LockPubSub.UNLOCK_MESSAGE, getSubscribeService().getPublishCommand());
+    }
 
     @Override
     public boolean tryLock() {
         return get(tryLockAsync());
     }
-
-    <T> RFuture<T> tryLockInnerAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId, RedisStrictCommand<T> command) {
-        return evalWriteSyncedAsync(getRawName(), LongCodec.INSTANCE, command,
-                "if ((redis.call('exists', KEYS[1]) == 0) " +
-                            "or (redis.call('hexists', KEYS[1], ARGV[2]) == 1)) then " +
-                        "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
-                        "redis.call('pexpire', KEYS[1], ARGV[1]); " +
-                        "return nil; " +
-                    "end; " +
-                    "return redis.call('pttl', KEYS[1]);",
-                Collections.singletonList(getRawName()), unit.toMillis(leaseTime), getLockName(threadId));
+    @Override
+    public boolean tryLock(long waitTime, TimeUnit unit) throws InterruptedException {
+        return tryLock(waitTime, -1, unit);
     }
-
     @Override
     public boolean tryLock(long waitTime, long leaseTime, TimeUnit unit) throws InterruptedException {
         long time = unit.toMillis(waitTime);
@@ -284,20 +301,10 @@ public class RedissonLock extends RedissonBaseLock {
         } finally {
             unsubscribe(commandExecutor.getNow(subscribeFuture), threadId);
         }
-//        return get(tryLockAsync(waitTime, leaseTime, unit));
-    }
-
-    protected CompletableFuture<RedissonLockEntry> subscribe(long threadId) {
-        return pubSub.subscribe(getEntryName(), getChannelName());
     }
 
     protected void unsubscribe(RedissonLockEntry entry, long threadId) {
         pubSub.unsubscribe(entry, getEntryName(), getChannelName());
-    }
-
-    @Override
-    public boolean tryLock(long waitTime, TimeUnit unit) throws InterruptedException {
-        return tryLock(waitTime, -1, unit);
     }
 
     @Override
@@ -306,45 +313,6 @@ public class RedissonLock extends RedissonBaseLock {
         if (unlockResult == null || unlockResult) {
             internalLockLeaseTime = getServiceManager().getCfg().getLockWatchdogTimeout();
         }
-    }
-
-    @Override
-    public RFuture<Boolean> forceUnlockAsync() {
-        cancelExpirationRenewal(null, null);
-        return commandExecutor.syncedEvalWithRetry(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                "if (redis.call('del', KEYS[1]) == 1) then "
-                        + "redis.call(ARGV[2], KEYS[2], ARGV[1]); "
-                        + "return 1 "
-                    + "else "
-                        + "return 0 "
-                    + "end",
-                Arrays.asList(getRawName(), getChannelName()), LockPubSub.UNLOCK_MESSAGE, getSubscribeService().getPublishCommand());
-    }
-
-    protected RFuture<Boolean> unlockInnerAsync(long threadId, String requestId, int timeout) {
-        return evalWriteSyncedAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                              "local val = redis.call('get', KEYS[3]); " +
-                                    "if val ~= false then " +
-                                        "return tonumber(val);" +
-                                    "end; " +
-
-                                    "if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then " +
-                                        "return nil;" +
-                                    "end; " +
-                                    "local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1); " +
-                                    "if (counter > 0) then " +
-                                        "redis.call('pexpire', KEYS[1], ARGV[2]); " +
-                                        "redis.call('set', KEYS[3], 0, 'px', ARGV[5]); " +
-                                        "return 0; " +
-                                    "else " +
-                                        "redis.call('del', KEYS[1]); " +
-                                        "redis.call(ARGV[4], KEYS[2], ARGV[1]); " +
-                                        "redis.call('set', KEYS[3], 1, 'px', ARGV[5]); " +
-                                        "return 1; " +
-                                    "end; ",
-                                Arrays.asList(getRawName(), getChannelName(), getUnlockLatchName(requestId)),
-                                LockPubSub.UNLOCK_MESSAGE, internalLockLeaseTime,
-                                getLockName(threadId), getSubscribeService().getPublishCommand(), timeout);
     }
 
     @Override
@@ -428,6 +396,30 @@ public class RedissonLock extends RedissonBaseLock {
     @Override
     public RFuture<Boolean> tryLockAsync(long threadId) {
         return getServiceManager().execute(() -> tryAcquireOnceAsync(-1, -1, null, threadId));
+    }
+    private RFuture<Boolean> tryAcquireOnceAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
+        CompletionStage<Boolean> acquiredFuture;
+        if (leaseTime > 0) {
+            acquiredFuture = tryLockInnerAsync(waitTime, leaseTime, unit, threadId, RedisCommands.EVAL_NULL_BOOLEAN);
+        } else {
+            acquiredFuture = tryLockInnerAsync(waitTime, internalLockLeaseTime,
+                    TimeUnit.MILLISECONDS, threadId, RedisCommands.EVAL_NULL_BOOLEAN);
+        }
+
+        acquiredFuture = handleNoSync(threadId, acquiredFuture);
+
+        CompletionStage<Boolean> f = acquiredFuture.thenApply(acquired -> {
+            // lock acquired
+            if (acquired) {
+                if (leaseTime > 0) {
+                    internalLockLeaseTime = unit.toMillis(leaseTime);
+                } else {
+                    scheduleExpirationRenewal(threadId);
+                }
+            }
+            return acquired;
+        });
+        return new CompletableFutureWrapper<>(f);
     }
 
     @Override
@@ -573,5 +565,8 @@ public class RedissonLock extends RedissonBaseLock {
         });
     }
 
+    String getUnlockLatchName(String requestId) {
+        return prefixName("redisson_unlock_latch", getRawName()) + ":" + requestId;
+    }
 
 }
